@@ -36,6 +36,12 @@ network, in the order of routing.parquet. The specification initializes the fore
 
 A member whose file exists is not routed again; delete it to route it again. Each file is written to a temporary
 name and renamed into place, so an interrupted run never leaves a file that looks finished.
+
+With --final-state the script makes no forecast. It routes every member from --init-state only up to --state-at-hour
+(hour 24 by default), saves no discharge, and saves the mean of the members' channel states at that hour, which
+river-route computes in ensemble mode, to --final-state. That file is the --init-state of the forecast initialized at
+that hour, so running this once a day carries a retrospective state forward to today. It is skipped when
+--final-state exists, and written under a temporary name and renamed into place.
 """
 
 import argparse
@@ -64,6 +70,7 @@ class ForecastRunoff(rr.runoff.ECMWFGribReducedGrid):
     """ECMWFGribReducedGrid for accumulations from ``initialization``, interpolated onto every hour after it."""
 
     initialization: np.datetime64 | None = field(default=None, init=False)
+    last_hour: int | None = field(default=None, init=False)  # route only the hours up to this one, None every hour
 
     def read_runoff(self, runoff_data):
         runoff, dates, conversion_factor = super().read_runoff(runoff_data)
@@ -73,6 +80,11 @@ class ForecastRunoff(rr.runoff.ECMWFGribReducedGrid):
         if hours[0] <= 0 or np.any(np.diff(hours) <= 0) or np.any(hours % 1):
             raise ValueError(f'{runoff_data} is not accumulated at whole hours after {self.initialization}')
         target = np.arange(hours[0], hours[-1] + 1)
+        if self.last_hour is not None:
+            if hours[-1] < self.last_hour:
+                raise ValueError(f'{runoff_data} ends {hours[-1]:.0f} hours after {self.initialization}, '
+                                 f'before hour {self.last_hour}')
+            target = target[target <= self.last_hour]
         after = np.searchsorted(hours, target)  # the first step at or after each hour
         before = np.maximum(after - 1, 0)
         span = hours[after] - hours[before]
@@ -177,21 +189,49 @@ if __name__ == '__main__':
                         help='channel state parquet every member starts from; default empty channels')
     parser.add_argument('--members', type=int, nargs='+', help='route only these members, 0 the control and 1..50')
     parser.add_argument('--threads', type=int, default=os.cpu_count() or 8, help='routing threads')
+    parser.add_argument('--final-state', type=Path, default=None,
+                        help='make no forecast: save here the members\' mean channel state at --state-at-hour, '
+                             'routed from --init-state, and no discharge')
+    parser.add_argument('--state-at-hour', type=int, default=24,
+                        help='with --final-state, the hour after the initialization to save the state at, a '
+                             'multiple of the forecast step; default 24')
     args = parser.parse_args()
 
     began = time.time()
+    with_final_state = args.final_state is not None
+    if with_final_state:
+        if args.init_state is None:
+            parser.error('--final-state routes from --init-state, so it needs one')
+        if args.members:
+            parser.error('--final-state saves the mean of every member, so it takes no --members')
+        if not (0 < args.state_at_hour <= rfs_spec.FORECAST_STEPS * rfs_spec.FORECAST_STEP_HOURS
+                and args.state_at_hour % rfs_spec.FORECAST_STEP_HOURS == 0):
+            parser.error(f'--state-at-hour {args.state_at_hour} is not a multiple of {rfs_spec.FORECAST_STEP_HOURS} '
+                         f'hours within the forecast')
+        if args.final_state.exists():  # before the GRIB files are looked for: a done state needs none
+            print(f'{args.final_state}: the state is already exists', flush=True)
+            raise SystemExit(0)
     initialization = args.initialization or latest_initialization(args.ifs)
     files = forecast_files(args.ifs, initialization)
     wanted = args.members or rfs_spec.MEMBERS.tolist()
     if missing := sorted(set(wanted) - set(files)):
         raise SystemExit(f'{initialization:%Y-%m-%d %H}z has no GRIB file in {args.ifs} for members {missing}')
-    work_dir = args.work_dir / f'{initialization:%Y%m%d%H}'
-    work_dir.mkdir(parents=True, exist_ok=True)
-    todo = [m for m in wanted if not member_file(work_dir, m).exists()]
-    print(f'{initialization:%Y-%m-%d %H}z: {len(wanted) - len(todo)} of {len(wanted)} members already routed, '
-          f'into {work_dir}', flush=True)
-    if not todo:
-        raise SystemExit(0)
+    if with_final_state:
+        args.final_state.parent.mkdir(parents=True, exist_ok=True)
+        partial_state = args.final_state.with_suffix('.partial.parquet')
+        todo = wanted  # the state is the mean of every member, so all of them are routed every time
+        outputs = [os.devnull] * len(todo)  # river-route routes the discharge and discards it
+        print(f'{initialization:%Y-%m-%d %H}z: advancing the channel state to hour {args.state_at_hour} with '
+              f'{len(todo)} members into {args.final_state}', flush=True)
+    else:
+        work_dir = args.work_dir / f'{initialization:%Y%m%d%H}'
+        work_dir.mkdir(parents=True, exist_ok=True)
+        todo = [m for m in wanted if not member_file(work_dir, m).exists()]
+        outputs = [member_file(work_dir, m) for m in todo]
+        print(f'{initialization:%Y-%m-%d %H}z: {len(wanted) - len(todo)} of {len(wanted)} members already routed, '
+              f'into {work_dir}', flush=True)
+        if not todo:
+            raise SystemExit(0)
     check_grid(files[todo[0]])
     if args.init_state is None:
         print('no --init-state: every member starts from empty channels', flush=True)
@@ -204,11 +244,12 @@ if __name__ == '__main__':
         transform='uniform',
         dt_routing=DT_ROUTING,
         dt_discharge=rfs_spec.FORECAST_STEP_HOURS * 3600,
-        # every member starts from the same state, and none is saved: the next forecast starts from the retrospective
+        # every member starts from the same state; a forecast saves none, and an "final_state" saves the members' mean
         runoff_processing_mode='ensemble',
         channel_state_init_file=args.init_state,
+        channel_state_final_file=partial_state if with_final_state else None,
         runoff_files=[files[m] for m in todo],
-        discharge_files=[member_file(work_dir, m) for m in todo],
+        discharge_files=outputs,
         grid_weights_file=args.routing / 'global' / f'gridweights_{rfs_spec.IFS_GRID}_global.nc',
         grid_accumulation_type='cumulative',
         var_grid_runoff='ro',
@@ -218,12 +259,18 @@ if __name__ == '__main__':
     )
     runoff = ForecastRunoff.from_configs(configs)
     runoff.initialization = initialization.to_datetime64()
-    river_ids = pd.read_parquet(configs.params_file, columns=['river_id'])['river_id'].to_numpy()
-    members = {member_file(work_dir, m).resolve(): m for m in todo}
-    writer = make_writer(initialization, members, river_ids, began)
-    router = rr.Router(configs, runoff=runoff).set_discharge_writer(writer)
+    runoff.last_hour = args.state_at_hour if with_final_state else None
+    router = rr.Router(configs, runoff=runoff)
+    if not with_final_state:
+        river_ids = pd.read_parquet(configs.params_file, columns=['river_id'])['river_id'].to_numpy()
+        members = {member_file(work_dir, m).resolve(): m for m in todo}
+        router.set_discharge_writer(make_writer(initialization, members, river_ids, began))
     print(f'routing {len(todo)} members of {runoff.river_ids.size:,} rivers on {args.threads} threads, weights read '
           f'in {time.time() - began:.0f} s', flush=True)
     with ThreadPoolExecutor(args.threads) as pool:
         router.route(thread_pool=pool, threads=args.threads)
+    if with_final_state:
+        os.replace(partial_state, args.final_state)
+        print(f'saved the state at hour {args.state_at_hour} after {initialization:%Y-%m-%d %H}z to {args.final_state}',
+              flush=True)
     print(f'{len(todo)} members routed in {(time.time() - began) / 60:.1f} min', flush=True)
